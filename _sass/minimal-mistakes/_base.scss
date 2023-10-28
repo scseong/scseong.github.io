@@ -117,7 +117,7 @@ blockquote {
     font-style: italic;
 
     &:before {
-      content: "\2014";
+      content: '\2014';
       padding-right: 5px;
     }
   }
@@ -136,8 +136,11 @@ a {
 
   &:hover {
     color: $link-color-hover;
+    text-decoration: underline;
     outline: 0;
   }
+
+  text-decoration: none;
 }
 
 /* buttons */
@@ -330,7 +333,7 @@ a,
 tr,
 td,
 form button,
-input[type="submit"],
+input[type='submit'],
 .btn,
 .highlight,
 .archive__item-teaser {
