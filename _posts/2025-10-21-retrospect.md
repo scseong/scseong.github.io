@@ -1,6 +1,6 @@
 ---
 layout: single
-title: "너드"에서 "함께 성장하는 개발자"로
+title: \"너드\"에서 \"함께 성장하는 개발자\"로
 category: TIL
 toc: true
 toc_sticky: true
