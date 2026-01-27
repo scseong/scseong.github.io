@@ -12,7 +12,7 @@ toc_sticky: true
 
 초기에는 항상 최신 데이터를 제공하고자 요청 시 서버에서 HTML을 생성하여 응답하는 SSR을 적용했습니다. 하지만 주보는 업로드된 뒤 다음 주보가 올라오기 전까지 내용이 거의 바뀌지 않았고 요청마다 같은 조회와 렌더링이 반복됐습니다.
 
-이 글에서는 성능 개선을 위해 Supabase SDK와 Next.js의 캐싱 메커니즘을 결합하고 실행 환경에 따라 클라이언트를 분리하며 Service Layer를 도입한 과정을 작성했습니다.
+이 글에서는 서버 최적화를 위해 Supabase SDK 요청에 Next.js 캐시를 적용했습니다. 그 과정에서 실행 환경별 Client 분리와 Service Layer 도입까지 필요했던 이유와 적용 방법을 다룹니다.
 
 > 사용한 기술들은 다음과 같습니다.
 >
@@ -29,7 +29,7 @@ toc_sticky: true
 주보 페이지는 다음과 같은 요구사항을 충족해야 합니다.
 
 - 검색 노출과 SNS 공유를 위해 서버 측에서 완성된 HTML과 메타데이터 제공
-- 주 1회 업데이트 후 거의 수정되지 않지만 새 주보가 업로드되면 즉시 반영되어야 함
+- 주 1회 게시되며 새 주보가 업로드되면 즉시 반영되어야 함
 - 특정 시간대 모바일 접속이 급증하는 환경에서도 안정적이고 빠른 응답 속도를 보장
 
 위 세 가지 목표를 동시에 충족하기 위해 처음 선택한 것은 실시간 생성 방식(SSR)이었습니다. 사용자가 접속하는 순간 서버가 페이지를 생성하므로 완성된 HTML을 제공하면서도 데이터의 최신성을 보장할 수 있었기 때문입니다.
@@ -56,7 +56,7 @@ export default async function BulletinPage({ searchParams }: Props) {
 
 주보 목록을 정적 페이지로 전환하기 위해서는 기존의 `/bulletin?year=2026&page=2` 쿼리 파라미터를 `/bulletin/year/2026/page/2` 경로 파라미터로 변경해야 했습니다. 실시간 요청에 의존하는 `searchParams`와 달리 경로 파라미터는 `generateStaticParams`를 통해 빌드 타임에 페이지를 미리 정적으로 생성할 수 있기 때문입니다.
 
-하지만 모든 필터 조합을 정적 페이지로 미리 생성하는 것은 빌드 타임과 관리 비용 면에서 비효율적이라 판단했습니다. 따라서 목록 페이지는 동적 렌더링을 유지하되 데이터 조회 결과만 캐싱하는 방식을 적용했습니다 .
+하지만 모든 필터 조합을 정적 페이지로 미리 생성하는 것은 빌드 타임과 관리 비용 면에서 비효율적이라 판단했습니다. 따라서 목록 페이지는 동적 렌더링을 유지하되 데이터 조회 결과만 캐싱하는 방식을 적용했습니다.
 
 ### 1.2 주보 상세 페이지: Full Route Cache를 통한 성능 극대화
 
@@ -71,8 +71,6 @@ export default async function BulletinPage({ searchParams }: Props) {
 ## 2. Supabase SDK와 Next.js 캐싱 통합
 
 Next.js의 강력한 캐싱 기능(`cache`, `revalidate`, `tags`)은 기본적으로 고유한 `fetch` API를 통해 동작합니다. 하지만 Supabase SDK는 내부적으로 HTTP 요청을 처리하면서도 캐시 옵션을 직접 전달할 수 있는 인터페이스를 제공하지 않아 캐시를 적용할 수 없었습니다.
-
-이를 해결하기 위해 여러 방법들을 시도했습니다.
 
 ### 2.1 캐시 적용을 위한 대안 검토
 
@@ -128,7 +126,7 @@ export const createFetch = ({ cache, tags, revalidate }: NextCacheOptions) =>
     });
 ```
 
-**Server-side Client 생성 시 적용**
+**Supabase Client 생성 시 적용**
 
 ```ts
 export const createServerSideClient = async (options: NextCacheOptions = {}) => {
@@ -158,11 +156,19 @@ const { data, error } = await supabase.getBulletins({ year, page });
 
 여기에 경로 기반 무효화(revalidatePath)를 통해 새 주보 업로드 시 모든 파라미터의 캐시를 즉시 갱신하며 항상 최신 데이터를 조회하도록 구현했습니다.
 
+```tsx
+// bulletin.actions.ts
+export const createBulletinAction = async (formData: FormData) => {
+  // ...
+  revalidatePath('/news/bulletin');
+}
+```
+
 **주요 성과 (Server & Network 지표)**
 
 - API 응답 속도: 112ms → 2ms (DB 조회 생략으로 약 50배 단축)
 - 서버 응답 대기 시간(TTFB):  104.98ms → 50.53ms
-- API 요청: 매 요청 발생 → 24시간당 1회
+- API 요청: 매 요청마다 발생 → 하루 1회
 
 |구현 결과|
 |:-:|
@@ -174,7 +180,7 @@ const { data, error } = await supabase.getBulletins({ year, page });
 
 <br/>
 
-## 3. 실행 환경에 따라 Supabase client를 분리해야 했던 이유
+## 3. 실행 환경에 따라 Supabase Client를 분리해야 했던 이유
 
 Next.js에서 Dynamic Route에 Full Route Cache를 적용하려면 아래의 조건을 만족해야 합니다.
 
@@ -185,9 +191,20 @@ Next.js에서 Dynamic Route에 Full Route Cache를 적용하려면 아래의 조
 주보 상세 페이지는 `[id]` 기반 Dynamic Route였고 발행 이후 거의 수정되지 않는 콘텐츠였기 때문에 Full Route Cache를 적용하기에 적합한 페이지였습니다. 또한 빌드 타임에 전체 주보 ID 목록을 조회할 수 있었기 때문에 `generateStaticParams`를 통해 생성할 페이지 경로를 미리 확정할 수 있었습니다.
 
 ```tsx
-export async function generateStaticParams() {
+export async function getAllBulletinIds() {
   const supabase = await createServerSideClient();
-  const { data: allBulletins, error } = await supabase.getAllBulltinIds();
+  const { data, error } = await supabase
+    .from(BULLETIN_BUCKET)
+    .select('id')
+    .order('date', { ascending: false });
+
+  if (error) throw error;
+  return { data, error };
+}
+
+// /[id]/page.tsx
+export async function generateStaticParams() {
+  const { data: allBulletins, error } = await getAllBulletinIds();
 
   if (error || !allBulletins) {
     console.error('주보 ID 목록을 불러오는 데 실패했습니다:', error?.message);
@@ -207,30 +224,30 @@ Error: `cookies` was called outside a request scope
 Failed to collect page data for /news/bulletin/[id]
 ```
 
-`generateStaticParams`에서 사용한 `createServerSideClient`가 내부적으로 `cookies()`를 호출하고 있었기 때문입니다. `generateStaticParams`는 빌드 타임에 실행되는데 이 시점에는 요청 컨텍스트나 쿠키가 존재하지 않기 때문에 빌드가 중단되었습니다.
+원인은 `generateStaticParams`가 실행되는 시점에 있었습니다. 이 함수는 빌드 타임에 동작하지만 내부에서 호출한 `createServerSideClient`는 `cookies()`를 참조하고 있었습니다. 빌드 단계에서는 요청(Request)이나 쿠키 정보가 존재하지 않기 때문에 런타임 에러가 발생했고 이로 인해 빌드가 중단되었습니다.
 
-빌드 타임에는 쿠키를 읽을 수 없고, 요청 시점에는 쿠키 기반 인증이 필요했습니다. 같은 서버 환경이라도 실행 시점에 따라 동작 방식이 달랐기 때문에 Supabase Client를 상황에 맞게 분리할 필요가 있었습니다.
+즉, 요청과 쿠키 컨텍스트에 의존하는 client를 빌드 타임에 사용한 것이 문제였습니다. 이 문제를 계기로 실행 환경에 따라 Supabase client의 역할과 사용 범위를 구분하게 되었습니다.
 
 <br/>
 
 ## 4. 실행 환경에 따른 Supabase Client 분리
 
-Supabase Client를 실행 환경을 기준으로 나누기로 했습니다. 
+Supabase Client는 실행 환경에 따라 접근 가능한 정보와 제약이 달랐습니다. 브라우저와 서버 요청 처리 환경에서는 쿠키/세션을 통해 사용자를 식별해야 했고 빌드 타임에서는 요청 컨텍스트 없이 정적 데이터 조회만 가능했습니다. 또한 Next.js 캐시를 적용할 수 있는 방식도 실행 환경에 따라 달랐습니다.
+
+이 차이를 기준으로 Supabase client를 실행 환경별로 나누었고 각 client의 특성을 아래와 같이 구분했습니다.
 
 ### 4.1. 클라이언트 유형별 비교
 
-| Client 유형    | 실행 환경        | 생성 도구              | 캐시 사용 여부 | 핵심 용도                           |
-| -------------- | ---------------- | ---------------------- | -------------- | ----------------------------------- |
-| Browser Client | 브라우저         | createBrowserClient    | 미사용         | CSR 환경의 데이터 조회 및 상태 변경 |
-| Server Client  | 서버             | createServerClient     | 선택적         | 사용자 세션 기반 데이터 접근        |
-| Static Client  | 정적 생성 환경   | createClient (Anon)    | 강력 사용      | 정적 페이지 생성                    |
-| Admin Client   | 서버 (보안 환경) | createClient (Service) | 사용 안 함     | RLS 우회 및 시스템 작업             |
+| Client 유형    | 실행 환경              | 쿠키/세션 접근 | Next.js 캐시 적용 | 핵심 용도                                       |
+| -------------- | ---------------------- | -------------- | ----------------- | ----------------------------------------------- |
+| Browser Client | 브라우저               | ○              | ✕                 | 실시간 구독, 사용자 인터랙션(UI)                |
+| Server Client  | 서버 런타임(요청 처리) | ○              | △                 | RLS 기반 조회/쓰기, Server Action/Route Handler |
+| Static Client  | 빌드 타임 / ISR        | ✕              | ○                 | `generateStaticParams`, 정적 페이지 생성        |
+| Admin Client   | 서버 런타임            | ✕              | ✕                 | RLS 우회(관리자/시스템 작업)                    |
 
 ### 4.2. 클라이언트별 상세 구현 및 특징
 
-#### 1) Browser Client
-
-**브라우저 환경에서 사용자 세션 유지와 실시간 처리를 담당합니다.**
+#### 1) Browser Client - 브라우저에서 세션 유지/실시간 처리
 
 ```ts
 'use client';
@@ -243,13 +260,11 @@ export function getSupabaseBrowserClient() {
 }
 ```
 
-- 싱글톤 패턴 적용: 클라이언트 사이드에서는 페이지 이동과 리렌더링이 잦습니다. 인스턴스를 매번 생성하면 Realtime 연결 중복 및 리소스 낭비가 발생하므로 하나의 인스턴스를 재사용합니다.
+- 클라이언트 사이드에서는 페이지 이동과 리렌더링이 잦습니다. 인스턴스를 매번 생성하면 Realtime 연결 중복 및 리소스 낭비가 발생하므로 하나의 인스턴스를 재사용합니다.
 
-- 캐싱 제외: 서버 렌더링 결과에 영향을 주지 않으므로 Next.js의 서버 캐싱을 적용하지 않습니다.
+- 서버 렌더링 결과에 영향을 주지 않으므로 Next.js의 서버 캐싱을 적용하지 않습니다.
 
-#### 2) Server Client
-
-**매 요청(Request)마다 실행되며 사용자 쿠키를 기반으로 데이터를 반환합니다.**
+#### 2) Server Client - 서버 런타임(요청 처리)에서 쿠키 기반 RLS 조회
 
 ```tsx
 export const createServerSideClient = async (options = {}) => {
@@ -262,12 +277,10 @@ export const createServerSideClient = async (options = {}) => {
 };
 ```
 
-- 요청 단위 생성: Server Component, Server Action, Route Handler에서 사용됩니다.
-- 세션 기반 접근: 쿠키를 통해 사용자를 식별하고 RLS(Row Level Security)가 적용된 데이터를 조회합니다. 사용자별로 결과가 다르므로 기본적으로 `no-store`를 적용하고 필요시 부분적 캐싱을 적용합니다.
+- Server Component, Server Action, Route Handler에서 사용됩니다.
+- 쿠키를 통해 사용자를 식별하고 RLS(Row Level Security)가 적용된 데이터를 조회합니다. 사용자별로 결과가 다르므로 기본적으로 `no-store`를 적용하고 필요시 부분적 캐싱을 적용합니다.
 
-#### 3) Static Client
-
-**요청(Request) 및 세션 컨텍스트 없이 모든 사용자에게 공통된 정적 페이지를 생성합니다.**
+#### 3) Static Client - 빌드 타임/ISR에서 정적 페이지 생성
 
 ```tsx
 export const createStaticClient = (options: NextCacheOptions = {}) => {
@@ -278,12 +291,10 @@ export const createStaticClient = (options: NextCacheOptions = {}) => {
 };
 ```
 
-- 정적 최적화: 빌드 타임이나 ISR(Incremental Static Regeneration) 시점에 실행됩니다.
-- 강력한 캐싱: `force-cache`를 통해 API 응답을 캐싱하여 빌드 속도와 페이지 로드 성능을 극대화합니다.
+- 빌드 타임이나 ISR 시점에 실행됩니다.
+- `force-cache`를 통해 API 응답을 캐싱하여 빌드 속도와 페이지 로드 성능을 극대화합니다.
 
-#### 4) Admin Client
-
-**보안 정책(RLS)을 우회하여 시스템 수준의 작업을 수행합니다.**
+#### 4) Admin Client - 보안 정책(RLS) 우회
 
 ```tsx
 export const createAdminServerClient = (): SupabaseClient<Database> => {
@@ -293,7 +304,88 @@ export const createAdminServerClient = (): SupabaseClient<Database> => {
 };
 ```
 
-- 권한 우회: `SERVICE_ROLE_KEY`를 사용하여 모든 RLS를 무효화하고 데이터베이스 전체에 접근합니다.
-- 보안 주의: 키 노출 시 심각한 보안 사고로 이어지므로 반드시 서버 환경에서만 호출하며 데이터 무결성을 위해 캐싱은 사용하지 않습니다.
+- `SERVICE_ROLE_KEY`를 사용하여 모든 RLS를 무효화하고 데이터베이스 전체에 접근합니다.
+- 키 노출 시 심각한 보안 사고로 이어지므로 반드시 서버 환경에서만 호출하며 데이터 무결성을 위해 캐싱은 사용하지 않습니다.
+
+### 4.3. Client 분리 이후 남은 문제
+
+Client를 분리하면서 빌드 타임 제약과 실행 환경별 요구사항은 해결할 수 있었지만 `custom fetch` 적용 이후 캐시 옵션이 Client 생성 시점에 결정되면서 다른 문제가 남았습니다. 호출부에서 환경에 맞춰 Client를 직접 생성하기 시작하면 동일한 쿼리 로직이 실행 컨텍스트별로 반복되기 쉽고 캐시 설정까지 함께 분기되어 변경 시 수정 지점이 늘어났습니다.
+
+예를 들어 주보 상세 조회는 쿼리 자체는 동일하지만 상세 페이지에서는 Full Route Cache를 위해 Static Client를 사용해야 했고 수정 페이지에서는 세션 기반 동작을 위해 Browser Client를 사용해야 했습니다. 
+
+```tsx
+// ISR 상세 페이지용 (Static Client + 캐시 옵션)
+export const fetchBulletinDetailStatic = (id: string) => {
+  const supabase = createStaticClient({ tags: [`bulletin-${id}`], revalidate: 86400 });
+  return supabase.from('bulletins').select('*').eq('id', Number(id)).single();
+};
+
+// CSR 수정 페이지용 (Browser Client + 세션)
+export const fetchBulletinDetailBrowser = (id: string) => {
+  const supabase = getSupabaseBrowserClient();
+  return supabase.from('bulletins').select('*').eq('id', Number(id)).single();
+};
+```
+
+<br/>
+
+## 5. Service Layer 도입: 쿼리 로직과 캐시 설정 분리
+
+Client를 실행 환경별로 분리한 이후에도 호출부에서 직접 캐시 옵션과 Client를 조합해야 하는 문제는 남아 있었습니다. 동일한 데이터에 서로 다른 캐시 정책이 적용되거나 쿼리 변경과 캐시 변경이 함께 발생하는 구조는 관리 부담이 컸습니다.
+
+이를 해결하기 위해 캐시 정책, 쿼리 로직, 실행 환경 조합을 각각 분리하는 Service Layer를 도입했습니다.
+
+### 5.1 캐시 정책 정의
+
+태그와 revalidate 값을 호출부마다 지정하면 관리가 어렵고 동일 데이터에 서로 다른 캐시 정책이 적용될 수 있습니다. 이를 방지하기 위해 캐시 정책을 고정된 규칙으로 정의했습니다.
+
+```ts
+// services/bulletin/bulletin-cache.ts
+const ROOT = 'bulletin';
+
+export const bulletinCache = {
+  list: () => ({ tags: [ROOT, 'bulletin-list'], revalidate: 86400 }),
+  detail: (id: string | number) => ({
+    tags: [ROOT, 'bulletin-detail', `bulletin-detail-${id}`],
+    revalidate: 86400
+  }),
+  // ...
+} as const;
+```
+
+### 5.2 쿼리 로직(Service)
+
+Service Layer는 Client를 전달받아 데이터베이스 쿼리만 수행합니다.
+
+```ts
+// services/bulletin/bulletin-service.ts
+export const bulletinService = (supabase: SupabaseClient<Database>) => ({
+  fetchBulletinList: async ({ year, page = 1, limit = 10 }: BulletinParams = {}) => {
+    let query = supabase.from('bulletins').select('*', { count: 'exact' });
+    if (year) query = query.gte('date', `${year}-01-01`).lte('date', `${year}-12-31`);
+    
+    return await query.range((page - 1) * limit, page * limit - 1);
+  },
+  // ... fetchBulletinDetailById, fetchAllBulletinIds 등
+});
+```
+
+### 5.3 실행 환경 조합(Interface)
+
+최종적으로 서버 컴포넌트나 페이지에서 사용할 인터페이스입니다. Client와 캐시 정책을 조합하여 실제 데이터를 페칭합니다.
+
+```ts
+export const fetchBulletinList = (params: BulletinParams = {}) => {
+  const supabase = createStaticClient(bulletinCache.list());
+  return bulletinService(supabase).fetchBulletinList(params);
+};
+
+export const fetchBulletinDetailById = (id: string) => {
+  const supabase = createStaticClient(bulletinCache.detail(id));
+  return bulletinService(supabase).fetchBulletinDetailById(id);
+};
+```
+
+쿼리 변경은 Service에서만, 캐시 정책 변경은 Cache 정의에서만 발생하며 페이지는 데이터 조회를 위한 단일 함수만 호출합니다. 이 구조를 통해 데이터 페칭, 캐싱, 실행 환경에 대한 책임을 명확히 분리할 수 있었습니다.
 
 
